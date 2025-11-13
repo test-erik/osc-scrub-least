@@ -33,7 +33,7 @@ Usage:
   $0 [-n NUM] [--debug] [--help]
 
 Options:
-  -n NUM     Show the NUM oldest PGs (default: 5)
+  -n NUM     Show the NUM oldest PGs (default: $n)
   --debug    Print parsed epoch timestamps for each PG
   --help     Show this help
 USAGE
