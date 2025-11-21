@@ -7,35 +7,38 @@ use Getopt::Long qw(:config no_auto_abbrev);
 use Cpanel::JSON::XS qw(decode_json);
 use DateTime::Format::ISO8601;
 use Try::Tiny;
+use List::Util qw(uniq);
 
 # -----------------------------------------------------------------------------
 # CLI options
-#   -n <NUM> : show the NUM oldest deep-scrub PGs (default: 5)
-#   --debug  : print parsed epoch timestamps to stderr for verification
-#   --help   : usage
 # -----------------------------------------------------------------------------
+my $n      = 5;
+my $help   = 0;
+my $debug  = 0;
+my $scrubs = 4;      # target for osd_max_scrubs
+my $emit_cmds = 1;   # print copy/paste commands
 
-my $n = 5;
-my $help;
-my $debug = 0;
-
-Getopt::Long::GetOptions(
-    'n=i'   => \$n,
-    'help'  => \$help,
-    'debug' => \$debug,
+GetOptions(
+    'n=i'       => \$n,
+    'scrubs=i'  => \$scrubs,
+    'no-cmds'   => sub { $emit_cmds = 0 },
+    'debug'     => \$debug,
+    'help'      => \$help,
 ) or die "Invalid options. See --help.\n";
 
 if ($help) {
     print <<"USAGE";
-Show the PGs whose last deep scrub is longest ago.
+Show the PGs whose last deep scrub is longest ago and emit copy/paste commands.
 
 Usage:
-  $0 [-n NUM] [--debug] [--help]
+  $0 [-n NUM] [--scrubs NUM] [--no-cmds] [--debug] [--help]
 
 Options:
-  -n NUM     Show the NUM oldest PGs (default: $n)
-  --debug    Print parsed epoch timestamps for each PG
-  --help     Show this help
+  -n NUM        Show the NUM oldest PGs (default: 5)
+  --scrubs NUM  Set osd_max_scrubs to NUM for involved OSDs (default: 4)
+  --no-cmds     Do not print shell command snippets
+  --debug       Print parsed epoch timestamps per PG
+  --help        Show this help
 USAGE
     exit 0;
 }
@@ -43,17 +46,16 @@ USAGE
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
-
 sub slurp_cmd {
     my @cmd = @_;
     my $out = qx{@cmd 2>/dev/null};
     return $? == 0 ? $out : undef;
 }
 
-# Robust timestamp parser:
-#  - accepts "YYYY-MM-DD HH:MM:SS[.us]" (no TZ -> treat as UTC)
-#  - accepts ISO-8601 with Z, +HH:MM, or +HHMM (normalized to +HH:MM)
-# Returns epoch seconds (UTC); unknown/empty -> 0 (interpreted as "never")
+# Accepts:
+#  - "YYYY-MM-DD HH:MM:SS[.us]" (no TZ -> treat as UTC)
+#  - ISO-8601 with Z, +HH:MM, or +HHMM (normalized to +HH:MM)
+# Returns epoch seconds; unknown/empty -> 0
 sub parse_ts {
     my ($s) = @_;
     return 0 unless defined $s && length $s;
@@ -62,7 +64,7 @@ sub parse_ts {
     my $norm = $s;
     $norm =~ s/ /T/;                          # space → T
     $norm =~ s/([+\-]\d{2})(\d{2})$/$1:$2/;   # +HHMM → +HH:MM
-    $norm .= 'Z' unless $norm =~ /(?:Z|[+\-]\d{2}:\d{2})$/;  # add Z if TZ missing
+    $norm .= 'Z' unless $norm =~ /(?:Z|[+\-]\d{2}:\d{2})$/;
 
     my $epoch = try { DateTime::Format::ISO8601->parse_datetime($norm)->epoch }
                 catch { 0 };
@@ -70,7 +72,6 @@ sub parse_ts {
     return $epoch // 0;
 }
 
-# Extract the PG array across Ceph versions/commands
 sub extract_pg_array {
     my ($root) = @_;
     return $root if ref($root) eq 'ARRAY';
@@ -81,7 +82,6 @@ sub extract_pg_array {
     return [];
 }
 
-# Determine primary OSD robustly
 sub primary_osd_of {
     my ($pg) = @_;
     return $pg->{acting_primary} if defined $pg->{acting_primary};
@@ -91,7 +91,6 @@ sub primary_osd_of {
     return undef;
 }
 
-# Build acting set as comma-separated list
 sub acting_set_of {
     my ($pg) = @_;
     my $a = (ref($pg->{acting}) eq 'ARRAY') ? $pg->{acting}
@@ -103,8 +102,6 @@ sub acting_set_of {
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
-
-# Prefer modern 'ceph pg ls -f json', fallback to 'ceph pg dump_json'
 my $json = slurp_cmd(qw(ceph pg ls -f json))
         // slurp_cmd(qw(ceph pg dump_json))
         or die "Unable to read Ceph JSON\n";
@@ -115,7 +112,6 @@ my $root = eval { decode_json($json) }
 my $pgs = extract_pg_array($root);
 @$pgs or die "No PGs found\n";
 
-# Transform into rows
 my @rows = map {
     my $pgid = $_->{pgid};
     my $last = $_->{last_deep_scrub_stamp} // 'never';
@@ -129,7 +125,6 @@ my @rows = map {
     }
 } @$pgs;
 
-# Sort by oldest last-deep-scrub first; deterministic tie-breakers
 @rows = sort {
        ($a->{ts} // 0)       <=> ($b->{ts} // 0)
     || ($a->{last} // '')    cmp  ($b->{last} // '')
@@ -138,19 +133,34 @@ my @rows = map {
 
 die "No evaluatable PGs\n" unless @rows;
 
-# Bound N
 $n = @rows if $n > @rows;
 
-# Output table
-say sprintf "Top %d PGs by oldest deep scrub:\n", $n;
+say sprintf "Top %d PGs nach ältestem deep scrub:\n", $n;
 say sprintf "%-12s %-10s %-20s %s", "PGID", "Primary", "Acting", "Last Deep Scrub";
 say "-" x 70;
 
-for my $r (@rows[0 .. $n-1]) {
+my @top = @rows[0 .. $n-1];
+for my $r (@top) {
     printf "%-12s osd.%-8s %-20s %s\n",
         $r->{pgid},
         ($r->{primary} // 'unknown'),
         $r->{acting},
         ($r->{last} // 'never');
     printf STDERR "[debug] %s ts=%d\n", $r->{pgid}, $r->{ts} if $debug;
+}
+
+# -----------------------------------------------------------------------------
+# Copy/paste commands
+# -----------------------------------------------------------------------------
+if ($emit_cmds) {
+    my @pgids = map { $_->{pgid} } @top;
+    
+    # acting-Sets flatten + deduplizieren (Reihenfolge bleibt erhalten)
+    my @osds_flat = uniq grep { defined && length }
+    map  { split /[,\s]+/ }
+    map  { $_->{acting} } @top;
+    
+    say "\n# copy/paste:";
+    say "for i in @pgids ; do ceph pg deep-scrub \$i ; done";
+    say "for i in @osds_flat ; do ceph config set osd.\$i osd_max_scrubs $scrubs ; done";
 }
